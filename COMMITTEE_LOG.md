@@ -7,6 +7,12 @@ part of the library.
 
 ## 2026-10-21, first session
 
+**Base.** This branch sits on upstream's release commit `v2026.9.0` (`d476a23`), not on this
+fork's `main`: the crates kohaku-rs and the experiments build against are 2026.9.0 from
+crates.io, and this fork's `main` has moved past that API (for one, `Player::finalize` lost its
+batch-verifier parameter), so a `[patch.crates-io]` onto `main` does not build with them. The
+branch was first pushed on `main` (`f3f7021`, `24426ba`) and then rebuilt on the release commit.
+
 **Added: `bls12381::dkg::feldman_desmedt::run`** (ALPHA), with `Traffic`, `RunResult` and
 `RunError`. It runs one honest DKG or Reshare round in memory and reports, for each participant,
 the messages and encoded bytes it sent and received, and the three communication rounds. It is

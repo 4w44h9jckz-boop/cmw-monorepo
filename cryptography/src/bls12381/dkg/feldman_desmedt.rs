@@ -2327,16 +2327,13 @@ pub enum RunError<P: core::fmt::Debug> {
 /// over a network, where messages can be late, missing or malicious.
 #[stability(ALPHA)]
 #[allow(clippy::type_complexity)]
-pub fn run<V: Variant, S: Signer, M: Faults + Clone>(
+pub fn run<V: Variant, S: Signer, M: Faults + Clone, B: BatchVerifier<PublicKey = S::PublicKey>>(
     rng: &mut impl CryptoRng,
     info: Info<V, S::PublicKey>,
     dealers: Vec<(S, Option<Share>)>,
     players: Vec<S>,
     strategy: &impl Strategy,
-) -> Result<RunResult<V, S::PublicKey>, RunError<S::PublicKey>>
-where
-    S::PublicKey: BatchVerifier,
-{
+) -> Result<RunResult<V, S::PublicKey>, RunError<S::PublicKey>> {
     let mut traffic: BTreeMap<S::PublicKey, Traffic> = BTreeMap::new();
     let mut count = |from: &S::PublicKey, to: &S::PublicKey, bytes: usize| {
         if from == to {
@@ -2403,7 +2400,7 @@ where
     for (pk, player) in active {
         let started = std::time::Instant::now();
         let (out, share) = player
-            .finalize::<M>(&mut *rng, logs.clone(), strategy)
+            .finalize::<M, B>(&mut *rng, logs.clone(), strategy)
             .map_err(RunError::Finalize)?;
         *compute.entry(pk.clone()).or_default() += started.elapsed();
         match &output {
@@ -5293,7 +5290,7 @@ mod run_test {
     fn reshare_keeps_the_key_and_new_shares_sign() {
         let mut rng = test_rng();
         let first = signers(0, 4);
-        let dkg = run::<MinSig, _, N3f1>(
+        let dkg = run::<MinSig, _, N3f1, ed25519::Batch>(
             &mut rng,
             info(0, None, &first, &first),
             first.iter().map(|s| (s.clone(), None)).collect(),
@@ -5307,7 +5304,7 @@ mod run_test {
         let second = signers(100, 7);
         let quorum = dkg.output.quorum::<N3f1>() as usize;
         let dealers: Vec<_> = first.iter().take(quorum).cloned().collect();
-        let reshare = run::<MinSig, _, N3f1>(
+        let reshare = run::<MinSig, _, N3f1, ed25519::Batch>(
             &mut rng,
             info(1, Some(dkg.output.clone()), &dealers, &second),
             dealers
@@ -5329,7 +5326,7 @@ mod run_test {
     fn traffic_counts_every_message_once_per_recipient() {
         let mut rng = test_rng();
         let first = signers(0, 4);
-        let dkg = run::<MinSig, _, N3f1>(
+        let dkg = run::<MinSig, _, N3f1, ed25519::Batch>(
             &mut rng,
             info(0, None, &first, &first),
             first.iter().map(|s| (s.clone(), None)).collect(),
@@ -5352,7 +5349,7 @@ mod run_test {
         // dealing and its log; a player acks), so dealers and players share nothing.
         let second = signers(100, 5);
         let dealers: Vec<_> = first.iter().take(3).cloned().collect();
-        let reshare = run::<MinSig, _, N3f1>(
+        let reshare = run::<MinSig, _, N3f1, ed25519::Batch>(
             &mut rng,
             info(1, Some(dkg.output.clone()), &dealers, &second),
             dealers
@@ -5376,7 +5373,7 @@ mod run_test {
         let first = signers(0, 4);
         let (previous, _) =
             deal::<MinSig, _, N3f1>(&mut rng, Mode::NonZeroCounter, set(&first)).expect("deal");
-        let result = run::<MinSig, _, N3f1>(
+        let result = run::<MinSig, _, N3f1, ed25519::Batch>(
             &mut rng,
             info(1, Some(previous), &first, &first),
             first.iter().map(|s| (s.clone(), None)).collect(),
@@ -5392,7 +5389,7 @@ mod run_test {
         // still produces a signature valid under the unchanged key.
         let mut rng = test_rng();
         let first = signers(0, 4);
-        let dkg = run::<MinSig, _, N3f1>(
+        let dkg = run::<MinSig, _, N3f1, ed25519::Batch>(
             &mut rng,
             info(0, None, &first, &first),
             first.iter().map(|s| (s.clone(), None)).collect(),
@@ -5401,7 +5398,7 @@ mod run_test {
         )
         .expect("dkg");
         let second = signers(100, 4);
-        let reshare = run::<MinSig, _, N3f1>(
+        let reshare = run::<MinSig, _, N3f1, ed25519::Batch>(
             &mut rng,
             info(1, Some(dkg.output.clone()), &first, &second),
             first
