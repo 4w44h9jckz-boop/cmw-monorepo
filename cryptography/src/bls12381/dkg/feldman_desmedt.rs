@@ -357,6 +357,7 @@ use crate::{
 use commonware_codec::{
     Encode, EncodeSize, Mode as CodecMode, RangeCfg, Read, ReadExt, Write, mode, modes,
 };
+use commonware_macros::stability;
 use commonware_math::{
     algebra::{Additive, CryptoGroup, Random, Ring as _},
     poly::{Interpolator, Poly},
@@ -2247,6 +2248,169 @@ pub fn deal_anonymous<V: Variant, M: Faults>(
     let players = (0..n.get()).try_collect().unwrap();
     let (output, shares) = deal::<V, _, M>(rng, mode, players).unwrap();
     (output.public().clone(), shares.values().to_vec())
+}
+
+/// What one participant sent and received in a round run by [`run`], counting every message to
+/// another participant once per recipient and measuring it by its encoded size.
+///
+/// A dealer sends each player a [`DealerPubMsg`] and a [`DealerPrivMsg`], receives a
+/// [`PlayerAck`] from each, and broadcasts its [`SignedDealerLog`] to every player. A
+/// participant that is both a dealer and a player sends nothing to itself.
+#[stability(ALPHA)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Traffic {
+    /// Messages sent to other participants.
+    pub sent_messages: u64,
+    /// Encoded bytes sent to other participants.
+    pub sent_bytes: u64,
+    /// Messages received from other participants.
+    pub received_messages: u64,
+    /// Encoded bytes received from other participants.
+    pub received_bytes: u64,
+    /// The communication rounds this participant took part in, as a sender or a receiver.
+    pub rounds: u32,
+}
+
+/// The result of [`run`]: the round's public output, each player's share, and each
+/// participant's [`Traffic`].
+#[stability(ALPHA)]
+pub struct RunResult<V: Variant, P: PublicKey> {
+    /// The public output every player agrees on.
+    pub output: Output<V, P>,
+    /// Each player's share.
+    pub shares: Map<P, Share>,
+    /// Each participant's traffic, dealers and players alike.
+    pub traffic: BTreeMap<P, Traffic>,
+}
+
+/// A failure of [`run`].
+#[stability(ALPHA)]
+#[derive(Debug, Error)]
+pub enum RunError<P: core::fmt::Debug> {
+    /// A dealer could not start.
+    #[error("dealer: {0}")]
+    Dealer(Error),
+    /// A player refused a dealing.
+    #[error("dealing: {0}")]
+    Dealing(DealerMessageError),
+    /// A dealer refused an acknowledgement.
+    #[error("ack: {0}")]
+    Ack(PlayerAckError),
+    /// A dealer's signed log did not check.
+    #[error("a dealer's log does not check")]
+    Log,
+    /// A player could not finalize.
+    #[error("finalize: {0:?}")]
+    Finalize(FinalizeError<P>),
+    /// A dealer has no share although the round reshares.
+    #[error("a dealer has no share of the previous key")]
+    MissingShare,
+    /// Players finished with different outputs.
+    #[error("players disagree on the output")]
+    Disagreement,
+}
+
+/// Runs one honest DKG or Reshare round in memory, from start to finalization, and reports
+/// what each participant sent and received.
+///
+/// `dealers` pairs each dealer's signer with its share of the previous round's key, which a
+/// Reshare (an `info` with a previous [`Output`]) requires and a DKG ignores. Every player
+/// acknowledges every dealing, so no share is revealed. The round's messages pass between the
+/// participants directly, as they would over authenticated channels: three communication rounds
+/// (dealings, acknowledgements, logs).
+///
+/// This is for measuring a round and for tests: a deployment runs [`Dealer`] and [`Player`]
+/// over a network, where messages can be late, missing or malicious.
+#[stability(ALPHA)]
+#[allow(clippy::type_complexity)]
+pub fn run<V: Variant, S: Signer, M: Faults + Clone>(
+    rng: &mut impl CryptoRng,
+    info: Info<V, S::PublicKey>,
+    dealers: Vec<(S, Option<Share>)>,
+    players: Vec<S>,
+    strategy: &impl Strategy,
+) -> Result<RunResult<V, S::PublicKey>, RunError<S::PublicKey>>
+where
+    S::PublicKey: BatchVerifier,
+{
+    let mut traffic: BTreeMap<S::PublicKey, Traffic> = BTreeMap::new();
+    let mut count = |from: &S::PublicKey, to: &S::PublicKey, bytes: usize| {
+        if from == to {
+            return;
+        }
+        let sent = traffic.entry(from.clone()).or_default();
+        sent.sent_messages += 1;
+        sent.sent_bytes += bytes as u64;
+        let received = traffic.entry(to.clone()).or_default();
+        received.received_messages += 1;
+        received.received_bytes += bytes as u64;
+    };
+    if info.previous.is_some() && dealers.iter().any(|(_, share)| share.is_none()) {
+        return Err(RunError::MissingShare);
+    }
+
+    let mut active: BTreeMap<S::PublicKey, Player<V, S>> = BTreeMap::new();
+    for signer in players {
+        let player = Player::new(info.clone(), signer.clone()).map_err(RunError::Dealer)?;
+        active.insert(signer.public_key(), player);
+    }
+
+    // Dealings out, acknowledgements back.
+    let mut logs = Logs::<V, S::PublicKey, M>::new(info.clone());
+    let mut signed = Vec::with_capacity(dealers.len());
+    for (signer, share) in dealers {
+        let me = signer.public_key();
+        let (mut dealer, pub_msg, priv_msgs) =
+            Dealer::start::<M>(&mut *rng, info.clone(), signer, share).map_err(RunError::Dealer)?;
+        for (to, priv_msg) in priv_msgs {
+            count(&me, &to, pub_msg.encode_size() + priv_msg.encode_size());
+            let player = active.get_mut(&to).expect("every player is in the round");
+            let ack = player
+                .dealer_message::<M>(me.clone(), pub_msg.clone(), priv_msg)
+                .map_err(RunError::Dealing)?
+                .expect("each dealing arrives once");
+            count(&to, &me, ack.encode_size());
+            dealer.receive_player_ack(to, ack).map_err(RunError::Ack)?;
+        }
+        signed.push((me, dealer.finalize::<M>()));
+    }
+
+    // Logs broadcast to every player.
+    for (me, log) in signed {
+        for to in active.keys() {
+            count(&me, to, log.encode_size());
+        }
+        let (dealer, log) = log.check(&info).ok_or(RunError::Log)?;
+        logs.record(dealer, log);
+    }
+
+    let mut output = None;
+    let mut shares = Vec::with_capacity(active.len());
+    for (pk, player) in active {
+        let (out, share) = player
+            .finalize::<M>(&mut *rng, logs.clone(), strategy)
+            .map_err(RunError::Finalize)?;
+        match &output {
+            None => output = Some(out),
+            Some(o) if *o != out => return Err(RunError::Disagreement),
+            Some(_) => {}
+        }
+        shares.push((pk, share));
+    }
+    // Every participant takes part in all three rounds: a dealer sends dealings, receives
+    // acknowledgements and sends its log; a player receives dealings, sends acknowledgements and
+    // receives logs.
+    for t in traffic.values_mut() {
+        t.rounds = 3;
+    }
+    Ok(RunResult {
+        output: output.expect("at least one player"),
+        shares: shares
+            .into_iter()
+            .try_collect()
+            .expect("players are unique"),
+        traffic,
+    })
 }
 
 #[cfg(any(feature = "arbitrary", test))]
@@ -5045,5 +5209,193 @@ mod test {
             CodecConformance<DealerLog<MinPk, ed25519::PublicKey>>,
             CodecConformance<SignedDealerLog<MinPk, ed25519::PrivateKey>>,
         }
+    }
+}
+
+#[cfg(test)]
+mod run_test {
+    use super::*;
+    use crate::{
+        bls12381::primitives::{
+            ops::{self, threshold},
+            variant::MinSig,
+        },
+        ed25519,
+    };
+    use commonware_utils::{N3f1, test_rng};
+
+    fn signers(from: u64, n: u64) -> Vec<ed25519::PrivateKey> {
+        (from..from + n)
+            .map(ed25519::PrivateKey::from_seed)
+            .collect()
+    }
+
+    fn set(signers: &[ed25519::PrivateKey]) -> Set<ed25519::PublicKey> {
+        signers
+            .iter()
+            .map(|s| s.public_key())
+            .try_collect()
+            .expect("unique")
+    }
+
+    fn info(
+        round: u64,
+        previous: Option<Output<MinSig, ed25519::PublicKey>>,
+        dealers: &[ed25519::PrivateKey],
+        players: &[ed25519::PrivateKey],
+    ) -> Info<MinSig, ed25519::PublicKey> {
+        Info::new::<N3f1>(
+            b"run-test",
+            round,
+            previous,
+            Mode::NonZeroCounter,
+            Reveal::V1,
+            set(dealers),
+            set(players),
+        )
+        .expect("valid round")
+    }
+
+    fn sign(
+        output: &Output<MinSig, ed25519::PublicKey>,
+        shares: &Map<ed25519::PublicKey, Share>,
+        take: usize,
+    ) -> Option<<MinSig as Variant>::Signature> {
+        let partials: Vec<_> = shares
+            .values()
+            .iter()
+            .take(take)
+            .map(|s| threshold::sign_message::<MinSig>(s, b"ns", b"message"))
+            .collect();
+        threshold::recover(output.public(), &partials, &Sequential).ok()
+    }
+
+    #[test]
+    fn reshare_keeps_the_key_and_new_shares_sign() {
+        let mut rng = test_rng();
+        let first = signers(0, 4);
+        let dkg = run::<MinSig, _, N3f1>(
+            &mut rng,
+            info(0, None, &first, &first),
+            first.iter().map(|s| (s.clone(), None)).collect(),
+            first.clone(),
+            &Sequential,
+        )
+        .expect("dkg");
+        let key = *dkg.output.public().public();
+
+        // A disjoint set of seven, dealt to by a quorum of the first.
+        let second = signers(100, 7);
+        let quorum = dkg.output.quorum::<N3f1>() as usize;
+        let dealers: Vec<_> = first.iter().take(quorum).cloned().collect();
+        let reshare = run::<MinSig, _, N3f1>(
+            &mut rng,
+            info(1, Some(dkg.output.clone()), &dealers, &second),
+            dealers
+                .iter()
+                .map(|s| (s.clone(), dkg.shares.get_value(&s.public_key()).cloned()))
+                .collect(),
+            second.clone(),
+            &Sequential,
+        )
+        .expect("reshare");
+        assert_eq!(*reshare.output.public().public(), key);
+
+        let q = reshare.output.quorum::<N3f1>() as usize;
+        let sig = sign(&reshare.output, &reshare.shares, q).expect("a quorum recovers");
+        ops::verify_message::<MinSig>(&key, b"ns", b"message", &sig).expect("verifies");
+    }
+
+    #[test]
+    fn traffic_counts_every_message_once_per_recipient() {
+        let mut rng = test_rng();
+        let first = signers(0, 4);
+        let dkg = run::<MinSig, _, N3f1>(
+            &mut rng,
+            info(0, None, &first, &first),
+            first.iter().map(|s| (s.clone(), None)).collect(),
+            first.clone(),
+            &Sequential,
+        )
+        .expect("dkg");
+        // Each of 4 participants deals to 3 others and acks 3 others' dealings, and broadcasts
+        // its log to 3 others: 9 messages sent, 9 received.
+        for t in dkg.traffic.values() {
+            assert_eq!(t.sent_messages, 9);
+            assert_eq!(t.received_messages, 9);
+            assert_eq!(t.rounds, 3);
+        }
+        let sent: u64 = dkg.traffic.values().map(|t| t.sent_bytes).sum();
+        let received: u64 = dkg.traffic.values().map(|t| t.received_bytes).sum();
+        assert_eq!(sent, received);
+
+        // Resharing to a disjoint set: a dealer sends 3 messages to each of 5 players (its
+        // dealing and its log; a player acks), so dealers and players share nothing.
+        let second = signers(100, 5);
+        let dealers: Vec<_> = first.iter().take(3).cloned().collect();
+        let reshare = run::<MinSig, _, N3f1>(
+            &mut rng,
+            info(1, Some(dkg.output.clone()), &dealers, &second),
+            dealers
+                .iter()
+                .map(|s| (s.clone(), dkg.shares.get_value(&s.public_key()).cloned()))
+                .collect(),
+            second,
+            &Sequential,
+        )
+        .expect("reshare");
+        for d in &dealers {
+            let t = reshare.traffic[&d.public_key()];
+            assert_eq!(t.sent_messages, 10);
+            assert_eq!(t.received_messages, 5);
+        }
+    }
+
+    #[test]
+    fn reshare_without_a_share_is_refused() {
+        let mut rng = test_rng();
+        let first = signers(0, 4);
+        let (previous, _) =
+            deal::<MinSig, _, N3f1>(&mut rng, Mode::NonZeroCounter, set(&first)).expect("deal");
+        let result = run::<MinSig, _, N3f1>(
+            &mut rng,
+            info(1, Some(previous), &first, &first),
+            first.iter().map(|s| (s.clone(), None)).collect(),
+            first.clone(),
+            &Sequential,
+        );
+        assert!(matches!(result, Err(RunError::MissingShare)));
+    }
+
+    #[test]
+    fn old_shares_still_sign_after_a_reshare() {
+        // Resharing does not erase anything: a quorum of the old committee that kept its shares
+        // still produces a signature valid under the unchanged key.
+        let mut rng = test_rng();
+        let first = signers(0, 4);
+        let dkg = run::<MinSig, _, N3f1>(
+            &mut rng,
+            info(0, None, &first, &first),
+            first.iter().map(|s| (s.clone(), None)).collect(),
+            first.clone(),
+            &Sequential,
+        )
+        .expect("dkg");
+        let second = signers(100, 4);
+        let reshare = run::<MinSig, _, N3f1>(
+            &mut rng,
+            info(1, Some(dkg.output.clone()), &first, &second),
+            first
+                .iter()
+                .map(|s| (s.clone(), dkg.shares.get_value(&s.public_key()).cloned()))
+                .collect(),
+            second,
+            &Sequential,
+        )
+        .expect("reshare");
+        let key = *reshare.output.public().public();
+        let q = dkg.output.quorum::<N3f1>() as usize;
+        let old = sign(&dkg.output, &dkg.shares, q).expect("old quorum recovers");
+        ops::verify_message::<MinSig>(&key, b"ns", b"message", &old).expect("still valid");
     }
 }
