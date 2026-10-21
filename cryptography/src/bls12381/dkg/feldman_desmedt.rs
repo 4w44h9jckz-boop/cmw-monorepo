@@ -2269,6 +2269,10 @@ pub struct Traffic {
     pub received_bytes: u64,
     /// The communication rounds this participant took part in, as a sender or a receiver.
     pub rounds: u32,
+    /// Time this participant spent computing its own part of the round: starting and
+    /// finalizing as a dealer, checking dealings and finalizing as a player. Measured on the
+    /// machine that ran [`run`], with every participant run in turn.
+    pub compute: core::time::Duration,
 }
 
 /// The result of [`run`]: the round's public output, each player's share, and each
@@ -2349,6 +2353,7 @@ where
         return Err(RunError::MissingShare);
     }
 
+    let mut compute: BTreeMap<S::PublicKey, core::time::Duration> = BTreeMap::new();
     let mut active: BTreeMap<S::PublicKey, Player<V, S>> = BTreeMap::new();
     for signer in players {
         let player = Player::new(info.clone(), signer.clone()).map_err(RunError::Dealer)?;
@@ -2360,19 +2365,27 @@ where
     let mut signed = Vec::with_capacity(dealers.len());
     for (signer, share) in dealers {
         let me = signer.public_key();
+        let started = std::time::Instant::now();
         let (mut dealer, pub_msg, priv_msgs) =
             Dealer::start::<M>(&mut *rng, info.clone(), signer, share).map_err(RunError::Dealer)?;
+        *compute.entry(me.clone()).or_default() += started.elapsed();
         for (to, priv_msg) in priv_msgs {
             count(&me, &to, pub_msg.encode_size() + priv_msg.encode_size());
             let player = active.get_mut(&to).expect("every player is in the round");
+            let started = std::time::Instant::now();
             let ack = player
                 .dealer_message::<M>(me.clone(), pub_msg.clone(), priv_msg)
                 .map_err(RunError::Dealing)?
                 .expect("each dealing arrives once");
+            *compute.entry(to.clone()).or_default() += started.elapsed();
             count(&to, &me, ack.encode_size());
+            let started = std::time::Instant::now();
             dealer.receive_player_ack(to, ack).map_err(RunError::Ack)?;
+            *compute.entry(me.clone()).or_default() += started.elapsed();
         }
-        signed.push((me, dealer.finalize::<M>()));
+        let started = std::time::Instant::now();
+        signed.push((me.clone(), dealer.finalize::<M>()));
+        *compute.entry(me).or_default() += started.elapsed();
     }
 
     // Logs broadcast to every player.
@@ -2380,6 +2393,7 @@ where
         for to in active.keys() {
             count(&me, to, log.encode_size());
         }
+        // Every player checks every log in deployment; here it is checked once, untimed.
         let (dealer, log) = log.check(&info).ok_or(RunError::Log)?;
         logs.record(dealer, log);
     }
@@ -2387,9 +2401,11 @@ where
     let mut output = None;
     let mut shares = Vec::with_capacity(active.len());
     for (pk, player) in active {
+        let started = std::time::Instant::now();
         let (out, share) = player
             .finalize::<M>(&mut *rng, logs.clone(), strategy)
             .map_err(RunError::Finalize)?;
+        *compute.entry(pk.clone()).or_default() += started.elapsed();
         match &output {
             None => output = Some(out),
             Some(o) if *o != out => return Err(RunError::Disagreement),
@@ -2402,6 +2418,9 @@ where
     // receives logs.
     for t in traffic.values_mut() {
         t.rounds = 3;
+    }
+    for (pk, spent) in compute {
+        traffic.entry(pk).or_default().compute = spent;
     }
     Ok(RunResult {
         output: output.expect("at least one player"),
